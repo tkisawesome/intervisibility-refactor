@@ -46,6 +46,40 @@ INTERVISIBILITY = 5 # not used: separate function!
 HORIZON_PROJECTION = 6
 ANGULAR_SIZE = 7
 
+# ------------------------------------------------------------------
+# Fast, vectorised line‑of‑sight for one octant of the window
+# ------------------------------------------------------------------
+def _vector_los(view_d,
+                mx, my,            # main‑ray indices
+                me_x, me_y,        # neighbour indices (interpolation)
+                error_matrix,      # Bresenham offset errors (0‑1)
+                error_mask,        # mask of “best” pixels
+                interpolate,       # True → interpolate between neighbours
+                mode):             # DEPTH or any other constant
+    """
+    Returns either a Boolean visibility mask or a float depth array
+    (interp − running_max), depending on *mode*.
+    """
+    # 1. Sample / interpolate terrain tangents along each ray ----------
+    interp = view_d[mx, my]                         # H(i,j) / dist
+    if interpolate:
+        interp += (view_d[me_x, me_y] - interp) * error_matrix
+
+    # 2. Running maximum of tangents outward from the observer ---------
+    cum_max = np.maximum.accumulate(interp, axis=1)
+
+    # 3. Produce the required output ----------------------------------
+    if mode == DEPTH:
+        # signed difference (positive → visible)
+        out_core = interp - cum_max
+    else:
+        # Boolean visibility mask
+        out_core = interp >= cum_max                # True / False
+
+    # 4. Scatter back into the octant‑shaped canvas --------------------
+    out = np.zeros_like(view_d, dtype=out_core.dtype)
+    out[mx[error_mask], my[error_mask]] = out_core[error_mask]
+    return out
 
 
 def dist(x1,y1,x2,y2, estimation=False):
@@ -216,65 +250,31 @@ def viewshed_raster (option, point, dem, interpolate = True):
        
     #interp = np.zeros(mx.shape) #initialise for speed ?
 
-    for steep in [False, True]: #- initially it's steep 0, 0
-
-        if steep: #swap x and y
-            
-            me_x, me_y = me_y , me_x 
-            mx, my = my,mx
+    # ------------------------------------------------------------------
+    #  Vectorised LoS over all 8 octants
+    # ------------------------------------------------------------------
+    for steep in [False, True]:
+        if steep:  # swap the role of x and y index arrays
+            me_x, me_y = me_y, me_x
+            mx,   my   = my,   mx
             mx_best, my_best = my_best, mx_best
 
-        
-        for view in views:                
-
+        for view in views:                   # views = 4 quadrant flips
+            # Work on a view of DEM and output mask in one go
             view_d = data[view]
-            view_o = mx_vis[view]              
-           
-            interp = view_d [mx,my]  #np.take(, axis = 1]
-            
-            if interpolate:
-                interp += (view_d[me_x, me_y] - interp) * error_matrix  
-                           
-            # do it here so we can subsitute targets below!
-            test_val = np.maximum.accumulate(interp, axis=1)
-            
-            
-            if isinstance(target_matrix,np.ndarray):
+            view_o = mx_vis[view]
 
-                view_tg = target_matrix[view]
-                # substitute target matrix, but only after the test matrix is calculated!
-                interp = view_tg[mx,my] 
+            res = _vector_los(view_d,
+                            mx, my,
+                            me_x, me_y,
+                            error_matrix,
+                            error_mask,
+                            interpolate,
+                            option)
 
-                if interpolate: 
-                
-                # could be done only on "good pixels", those with minimal error !!
-                # use mask on mx, my etc  - test for speed ...
-                    interp += (view_tg[me_x, me_y] - interp) * error_matrix
-     
-            # non-interpolated, normal                  
-           # v = data[mx,my] == np.maximum.accumulate(data[mx,my], axis=1)
-
-            if option == DEPTH: v = interp - test_val
-            else: v = interp >= test_val
-
-            if option == HORIZON:
-            #select last pixel (find max value in a reversed array (last axis!)
-                #argmax stops at the first occurence
-                #indices have to be re-reversed :)
-                #gives a flat array of 1 index for each row (axis=1)
-                
-                rev_max = dem.radius_pix - np.argmax(v[:, ::-1], axis=1) -1
-                               
-                v[:] = False
-
-                #radius = row n° for fancy index (should be some nicer way...               
-
-                v[ np.arange(dem.radius_pix +1), rev_max.flat ] = True
-
-
-            #np.compress faster than simple boolean mask.. ??
-               
-            view_o [mx_best, my_best] = v[error_mask] #       np.absolute(error_matrix[error_mask]) # for errors
+            # Write back exactly as the original algorithm did
+            # (assignment, not OR, so signed values survive for DEPTH mode)
+            view_o[mx_best, my_best] = res[mx_best, my_best]
             
     # delete areas that are outside max/min view angles (on the basis of the DEM).
     # we need to adjust for pixel based values
