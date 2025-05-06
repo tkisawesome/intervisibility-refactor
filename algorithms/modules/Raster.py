@@ -384,68 +384,68 @@ class Raster:
         self.raster = self.rst.ReadAsArray().astype(float)
         return self.raster
         
-    """
-    Insert a numpy matrix to the same place where data has been extracted.
-    Data can be added-up or chosen from highest/lowest values.
-    All parameteres are copied from class properties
-    because only one window is possible at a time.
-    """
-    def add_to_buffer(self, in_array, report = False):
 
-        try: in_array[self.mask] = self.fill
-        except: pass #an array may be unmasked 
+    def add_to_buffer(self, in_array, report=False):
+        """
+        Merge *in_array* (already the cropped window data) into the
+        global result buffer according to self.mode.
 
-        y_in = slice(*self.inside_window_slice[0])
-        x_in = slice(*self.inside_window_slice[1])
+        Parameters
+        ----------
+        in_array : 2‑D ndarray
+            Same shape as self.inside_window_slice, **already masked** if
+            self.mask applies.
+        report   : bool
+            If True, return (n_visible, n_total) like the old version.
+        """
+        # ------------------------------------------------------------------
+        # 1. Optionally apply the mask (skip reallocating m_in)
+        # ------------------------------------------------------------------
+        if hasattr(self, "mask"):
+            mask_y, mask_x = self.inside_window_slice
+            in_array[self.mask[mask_y, mask_x]] = self.fill
 
-        m_in = in_array [y_in, x_in]
-  
-
+        # ------------------------------------------------------------------
+        # 2. Get destination view just once
+        # ------------------------------------------------------------------
         if isinstance(self.result, np.ndarray):
-            m = self.result[self.window_slice]
-        else :
-            m = self.gdal_output.ReadAsArray(*self.gdal_slice).astype(float)
-    
-        if self.mode == SINGLE: m = m_in
-        
-        elif self.mode == ADD:  m += m_in
-
+            dest = self.result[self.window_slice]
         else:
-            flt = m_in < m if self.mode == MIN else m_in > m
-            
-        #there is a problem to initialise a comparison without knowing min/max values
-##            # nan will always give False in any comarison
-##            # so make a trick with isnan()...
-            flt[np.isnan(m)]= True
+            dest = self.gdal_output.ReadAsArray(*self.gdal_slice).astype(float)
 
-            m[flt]= m_in[flt]
-        
-        if not isinstance(self.result, np.ndarray): #write to file
-            
-            bd = self.gdal_output.GetRasterBand(1)
-            #for writing gdal takes only x and y offset (1st 2 values of self.gdal_slice)
-            bd.WriteArray( m, *self.gdal_slice[:2] )
-    
-            bd.FlushCache()
-            
-            
-            #np.where(self.result [self.window_slice] < in_array [self.inside_window_slice],
-            #         in_array [self.inside_window_slice], self.result [self.window_slice])      
-            
+        # ------------------------------------------------------------------
+        # 3. Combine according to mode (all in‑place, vectorised)
+        # ------------------------------------------------------------------
+        if   self.mode == SINGLE:   dest[...] = in_array
+        elif self.mode == ADD:      np.add(dest, in_array,  out=dest)
+        elif self.mode == MIN:      np.minimum(dest, in_array, out=dest)
+        elif self.mode == MAX:      np.maximum(dest, in_array, out=dest)
+        else:                       raise ValueError("Unknown buffer mode")
 
+        # ------------------------------------------------------------------
+        # 4. Persist to disk if using GDAL‑backed buffer
+        # ------------------------------------------------------------------
+        if not isinstance(self.result, np.ndarray):
+            band = self.gdal_output.GetRasterBand(1)
+            band.WriteArray(dest, *self.gdal_slice[:2])
+            band.FlushCache()
+
+        # ------------------------------------------------------------------
+        # 5. Optional visibility report (unchanged semantics)
+        # ------------------------------------------------------------------
         if report:
             try:
-                if self.fill != 0 :  m_in[self.mask[y_in, x_in]]=0
-                c = np.count_nonzero(m_in)
-                
-                 # Count values outside mask (mask is True on the outside !)
-                total = m_in.size - np.count_nonzero(self.mask[y_in, x_in])
+                n_total = in_array.size
+                if self.fill != 0:
+                    inmask = self.mask[mask_y, mask_x]
+                    n_total -= np.count_nonzero(inmask)
+                    vis = np.count_nonzero(in_array[~inmask])
+                else:
+                    vis = np.count_nonzero(in_array)
+                return vis, n_total
+            except Exception:
+                return np.count_nonzero(in_array), in_array.size
 
-                return ( c ,  total )
-
-            except: #unmasked array
-                return (np.count_nonzero(m_in), m_in.size) 
-    
     
     """
     Writing analysis result.
